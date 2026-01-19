@@ -17,7 +17,7 @@ import importlib
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Iterable
 from unittest import mock
 
 import pytest
@@ -157,6 +157,26 @@ def test_negative_delay_is_rejected():
         _stop_scheduler(scheduler)
 
 
+def test_extreme_delay_does_not_execute_early():
+    module = _import_scheduler_module()
+    clock = ControlledClock()
+    with _patched_time(module, clock):
+        scheduler = _new_scheduler(module)
+        _start_scheduler(scheduler)
+        try:
+            executed = threading.Event()
+            task = mock.Mock(side_effect=lambda: executed.set())
+
+            scheduler.schedule(10**9, task)
+
+            clock.allow_sleep()
+            clock.advance(1.0)
+            assert not executed.wait(timeout=0.1)
+            assert task.call_count == 0
+        finally:
+            _stop_scheduler(scheduler)
+
+
 def test_concurrent_dispatch_is_thread_safe():
     module = _import_scheduler_module()
     scheduler = _new_scheduler(module)
@@ -249,5 +269,37 @@ def test_cancellation_race_at_execution_boundary():
         assert task.call_count <= 1
         if cancel_result:
             assert task.call_count == 0
+    finally:
+        _stop_scheduler(scheduler)
+
+
+def test_concurrent_cancellation_race():
+    module = _import_scheduler_module()
+    scheduler = _new_scheduler(module)
+    _start_scheduler(scheduler)
+    try:
+        executed = queue.Queue()
+        start_barrier = threading.Barrier(10)
+
+        def schedule_and_cancel(index: int) -> None:
+            start_barrier.wait()
+            handle = scheduler.schedule(0.0, lambda: executed.put(index))
+            handle.cancel()
+
+        threads = [threading.Thread(target=schedule_and_cancel, args=(i,)) for i in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        received = set()
+        while True:
+            try:
+                received.add(executed.get(timeout=0.2))
+            except queue.Empty:
+                break
+
+        assert received.issubset(set(range(10)))
+        assert len(received) <= 10
     finally:
         _stop_scheduler(scheduler)
